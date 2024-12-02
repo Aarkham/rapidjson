@@ -1017,6 +1017,39 @@ private:
             RAPIDJSON_PARSE_ERROR(kParseErrorTermination, s.Tell());
     }
 
+    // CARLOS
+    // Parse unquoted string and generate String event. Different code paths for kParseInsituFlag.
+    // Consider the string until it finds , : [] {}
+    template<unsigned parseFlags, typename InputStream, typename Handler>
+    void ParseUnquotedString(InputStream& is, Handler& handler, bool isKey = false) {
+        internal::StreamLocalCopy<InputStream> copy(is);
+        InputStream& s(copy.s);
+
+        //RAPIDJSON_ASSERT(s.Peek() == '\"');
+        //s.Take();  // Skip '\"'
+
+        bool success = false;
+        if (parseFlags & kParseInsituFlag) {
+            typename InputStream::Ch *head = s.PutBegin();
+            ParseUnquotedStringToStream<parseFlags, SourceEncoding, SourceEncoding>(s, s);
+            RAPIDJSON_PARSE_ERROR_EARLY_RETURN_VOID;
+            size_t length = s.PutEnd(head) - 1;
+            RAPIDJSON_ASSERT(length <= 0xFFFFFFFF);
+            const typename TargetEncoding::Ch* const str = reinterpret_cast<typename TargetEncoding::Ch*>(head);
+            success = (isKey ? handler.Key(str, SizeType(length), false) : handler.String(str, SizeType(length), false));
+        }
+        else {
+            StackStream<typename TargetEncoding::Ch> stackStream(stack_);
+            ParseUnquotedStringToStream<parseFlags, SourceEncoding, TargetEncoding>(s, stackStream);
+            RAPIDJSON_PARSE_ERROR_EARLY_RETURN_VOID;
+            SizeType length = static_cast<SizeType>(stackStream.Length()) - 1;
+            const typename TargetEncoding::Ch* const str = stackStream.Pop();
+            success = (isKey ? handler.Key(str, length, true) : handler.String(str, length, true));
+        }
+        if (RAPIDJSON_UNLIKELY(!success))
+            RAPIDJSON_PARSE_ERROR(kParseErrorTermination, s.Tell());
+    }
+
     // Parse string to an output is
     // This function handles the prefix/suffix double quotes, escaping, and optional encoding validation.
     template<unsigned parseFlags, typename SEncoding, typename TEncoding, typename InputStream, typename OutputStream>
@@ -1083,6 +1116,130 @@ private:
                 os.Put('\0');   // null-terminate the string
                 return;
             }
+            else if (RAPIDJSON_UNLIKELY(static_cast<unsigned>(c) < 0x20)) { // RFC 4627: unescaped = %x20-21 / %x23-5B / %x5D-10FFFF
+                if (c == '\0')
+                    RAPIDJSON_PARSE_ERROR(kParseErrorStringMissQuotationMark, is.Tell());
+                else
+                    RAPIDJSON_PARSE_ERROR(kParseErrorStringInvalidEncoding, is.Tell());
+            }
+            else {
+                size_t offset = is.Tell();
+                if (RAPIDJSON_UNLIKELY((parseFlags & kParseValidateEncodingFlag ?
+                    !Transcoder<SEncoding, TEncoding>::Validate(is, os) :
+                    !Transcoder<SEncoding, TEncoding>::Transcode(is, os))))
+                    RAPIDJSON_PARSE_ERROR(kParseErrorStringInvalidEncoding, offset);
+            }
+        }
+    }
+
+    // CARLOS
+    // Parse string to an output is
+    // This function handles the prefix/suffix double quotes, escaping, and optional encoding validation.
+    // The string is valid until it encounters   , : [] {}
+    template<unsigned parseFlags, typename SEncoding, typename TEncoding, typename InputStream, typename OutputStream>
+    RAPIDJSON_FORCEINLINE void ParseUnquotedStringToStream(InputStream& is, OutputStream& os) {
+//!@cond RAPIDJSON_HIDDEN_FROM_DOXYGEN
+#define Z16 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        static const char escape[256] = {
+            Z16, Z16, 0, 0,'\"', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '/',
+            Z16, Z16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,'\\', 0, 0, 0,
+            0, 0,'\b', 0, 0, 0,'\f', 0, 0, 0, 0, 0, 0, 0,'\n', 0,
+            0, 0,'\r', 0,'\t', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            Z16, Z16, Z16, Z16, Z16, Z16, Z16, Z16
+        };
+#undef Z16
+//!@endcond
+
+        int parm_counter=0;
+        for (;;) {
+            // Scan and copy string before "\\\"" or < 0x20. This is an optional optimzation.
+            if (!(parseFlags & kParseValidateEncodingFlag))
+                ScanCopyUnescapedString(is, os);
+
+            Ch c = is.Peek();
+            if (RAPIDJSON_UNLIKELY(c == '\\')) {    // Escape
+                size_t escapeOffset = is.Tell();    // For invalid escaping, report the initial '\\' as error offset
+                is.Take();
+                Ch e = is.Peek();
+                if ((sizeof(Ch) == 1 || unsigned(e) < 256) && RAPIDJSON_LIKELY(escape[static_cast<unsigned char>(e)])) {
+                    is.Take();
+                    os.Put(static_cast<typename TEncoding::Ch>(escape[static_cast<unsigned char>(e)]));
+                }
+                else if ((parseFlags & kParseEscapedApostropheFlag) && RAPIDJSON_LIKELY(e == '\'')) { // Allow escaped apostrophe
+                    is.Take();
+                    os.Put('\'');
+                }
+                else if (RAPIDJSON_LIKELY(e == 'u')) {    // Unicode
+                    is.Take();
+                    unsigned codepoint = ParseHex4(is, escapeOffset);
+                    RAPIDJSON_PARSE_ERROR_EARLY_RETURN_VOID;
+                    if (RAPIDJSON_UNLIKELY(codepoint >= 0xD800 && codepoint <= 0xDFFF)) {
+                        // high surrogate, check if followed by valid low surrogate
+                        if (RAPIDJSON_LIKELY(codepoint <= 0xDBFF)) {
+                            // Handle UTF-16 surrogate pair
+                            if (RAPIDJSON_UNLIKELY(!Consume(is, '\\') || !Consume(is, 'u')))
+                                RAPIDJSON_PARSE_ERROR(kParseErrorStringUnicodeSurrogateInvalid, escapeOffset);
+                            unsigned codepoint2 = ParseHex4(is, escapeOffset);
+                            RAPIDJSON_PARSE_ERROR_EARLY_RETURN_VOID;
+                            if (RAPIDJSON_UNLIKELY(codepoint2 < 0xDC00 || codepoint2 > 0xDFFF))
+                                RAPIDJSON_PARSE_ERROR(kParseErrorStringUnicodeSurrogateInvalid, escapeOffset);
+                            codepoint = (((codepoint - 0xD800) << 10) | (codepoint2 - 0xDC00)) + 0x10000;
+                        }
+                        // single low surrogate
+                        else
+                        {
+                            RAPIDJSON_PARSE_ERROR(kParseErrorStringUnicodeSurrogateInvalid, escapeOffset);
+                        }
+                    }
+                    TEncoding::Encode(os, codepoint);
+                }
+                else
+                    RAPIDJSON_PARSE_ERROR(kParseErrorStringEscapeInvalid, escapeOffset);
+            }
+            else if (    RAPIDJSON_UNLIKELY(c == ':')
+                      || RAPIDJSON_UNLIKELY(c == '[') || RAPIDJSON_UNLIKELY(c==']')
+                      || RAPIDJSON_UNLIKELY(c == '{') || RAPIDJSON_UNLIKELY(c=='}')
+                    )
+              {    // Closing chars
+                os.Put('\0');   // null-terminate the string
+                return;
+              }
+            else if (    RAPIDJSON_UNLIKELY(c == '('))
+              {
+                parm_counter++;
+
+                size_t offset = is.Tell();
+                if (RAPIDJSON_UNLIKELY((parseFlags & kParseValidateEncodingFlag ?
+                    !Transcoder<SEncoding, TEncoding>::Validate(is, os) :
+                    !Transcoder<SEncoding, TEncoding>::Transcode(is, os))))
+                    RAPIDJSON_PARSE_ERROR(kParseErrorStringInvalidEncoding, offset);
+              }
+            else if (    RAPIDJSON_UNLIKELY(c == ')'))
+              {
+                parm_counter--;
+
+                size_t offset = is.Tell();
+                if (RAPIDJSON_UNLIKELY((parseFlags & kParseValidateEncodingFlag ?
+                    !Transcoder<SEncoding, TEncoding>::Validate(is, os) :
+                    !Transcoder<SEncoding, TEncoding>::Transcode(is, os))))
+                    RAPIDJSON_PARSE_ERROR(kParseErrorStringInvalidEncoding, offset);
+              }
+            else if ( RAPIDJSON_UNLIKELY(c == ','))
+              {
+                if(parm_counter<=0)
+                  {
+                    os.Put('\0');   // null-terminate the string
+                    return;
+                  }
+                else
+                  {
+                    size_t offset = is.Tell();
+                    if (RAPIDJSON_UNLIKELY((parseFlags & kParseValidateEncodingFlag ?
+                        !Transcoder<SEncoding, TEncoding>::Validate(is, os) :
+                        !Transcoder<SEncoding, TEncoding>::Transcode(is, os))))
+                        RAPIDJSON_PARSE_ERROR(kParseErrorStringInvalidEncoding, offset);
+                  }
+              }
             else if (RAPIDJSON_UNLIKELY(static_cast<unsigned>(c) < 0x20)) { // RFC 4627: unescaped = %x20-21 / %x23-5B / %x5D-10FFFF
                 if (c == '\0')
                     RAPIDJSON_PARSE_ERROR(kParseErrorStringMissQuotationMark, is.Tell());
@@ -1887,8 +2044,24 @@ private:
             case '{': ParseObject<parseFlags>(is, handler); break;
             case '[': ParseArray <parseFlags>(is, handler); break;
             default :
+              if(parseFlags & kParseNanAndInfFlag)
+                {
+                  // ParseNumber if this flag is active
+                  ParseNumber<parseFlags>(is, handler);
+                }
+              else
+                {
+                  // if begins with number
+                  if((is.Peek() >= '0' && is.Peek() <= '9') || is.Peek()=='-' || is.Peek()=='+' )
+                    {
                       ParseNumber<parseFlags>(is, handler);
-                      break;
+                    }
+                  else
+                    {
+                      ParseUnquotedString<parseFlags>(is, handler);
+                    }
+                }
+                break;
 
         }
     }
